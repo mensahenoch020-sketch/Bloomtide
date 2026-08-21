@@ -1,0 +1,1 @@
+-- Supabase is no longer used. Railway Postgres tables are created by server.js on startup.
