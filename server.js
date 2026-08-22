@@ -5,9 +5,27 @@ const bcrypt=require('bcryptjs');
 const helmet=require('helmet');
 const rateLimit=require('express-rate-limit');
 const path=require('path');
+const nodemailer=require('nodemailer');
 
 if(!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
+
+let mailer=null;
+if(process.env.SMTP_HOST&&process.env.SMTP_USER&&process.env.SMTP_PASS){
+  mailer=nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT)||587,secure:Number(process.env.SMTP_PORT)===465,auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});
+}else{
+  console.warn('Email notifications are disabled: set SMTP_HOST, SMTP_USER and SMTP_PASS in Railway Variables to enable them.');
+}
+const NOTIFY_EMAIL=process.env.NOTIFY_EMAIL||process.env.ADMIN_EMAIL;
+async function notify(subject,text){
+  if(!mailer||!NOTIFY_EMAIL)return;
+  try{
+    await mailer.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:NOTIFY_EMAIL,subject,text});
+  }catch(err){
+    console.error('Email notification failed:',err.message);
+  }
+}
+
 const app=express();
 const PORT=process.env.PORT||3000;
 const SESSION_SECRET=process.env.SESSION_SECRET||'development-only-secret';
@@ -26,6 +44,10 @@ async function initDb(){
     create table if not exists job_applications(id bigserial primary key,job_id bigint references jobs(id) on delete cascade,name text not null,email text not null,phone text,linkedin_url text,resume_url text,cover_letter text,status text not null default 'new',created_at timestamptz default now());
     alter table job_applications add column if not exists resume_url text;
     create table if not exists licenses(id bigserial primary key,state text not null,license_type text,license_number text,expires_on date,active boolean not null default true,created_at timestamptz default now());
+    alter table appraisal_requests add column if not exists fee numeric(12,2);
+    alter table appraisal_requests add column if not exists status text not null default 'new';
+    alter table jobs add column if not exists published boolean not null default false;
+    alter table jobs add column if not exists closing_date date;
   `);
   if(process.env.ADMIN_EMAIL&&process.env.ADMIN_PASSWORD){
     const hash=await bcrypt.hash(process.env.ADMIN_PASSWORD,12);
@@ -45,14 +67,14 @@ app.use('/admin.html',(req,res,next)=>{res.set('Cache-Control','no-store');next(
 app.use('/app.js',(req,res,next)=>{res.set('Cache-Control','no-store');next();});
 app.get('/api/health',asyncRoute(async(req,res)=>{await pool.query('select 1');res.json({ok:true});}));
 app.get('/api/address-suggestions',asyncRoute(async(req,res)=>{const q=safe(req.query.q||'',180);if(q.length<3)return res.json([]);const url=new URL('https://nominatim.openstreetmap.org/search');url.searchParams.set('q',q);url.searchParams.set('format','jsonv2');url.searchParams.set('addressdetails','1');url.searchParams.set('countrycodes','us');url.searchParams.set('limit','5');const r=await fetch(url,{headers:{'User-Agent':'Bloomtide/1.0 (charlierob1225@gmail.com)','Accept-Language':'en-US,en'}});if(!r.ok)return res.json([]);const data=await r.json();res.json(data.map(x=>({label:x.display_name,value:x.display_name})).slice(0,5));}));
-app.post('/api/appraisals',asyncRoute(async(req,res)=>{const {name,email,phone,property_address,property_type,purpose,preferred_inspection_date,message}=req.body;if(!name||!email||!phone||!property_address||!property_type||!purpose)return res.status(400).json({error:'Please complete all required fields.'});const r=await pool.query(`insert into appraisal_requests(name,email,phone,property_address,property_type,purpose,preferred_inspection_date,message) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,status`,[safe(name,150),safe(email,200),safe(phone,80),safe(property_address,400),safe(property_type,120),safe(purpose,200),preferred_inspection_date||null,safe(message)]);res.status(201).json(r.rows[0]);}));
+app.post('/api/appraisals',asyncRoute(async(req,res)=>{const {name,email,phone,property_address,property_type,purpose,preferred_inspection_date,message}=req.body;if(!name||!email||!phone||!property_address||!property_type||!purpose)return res.status(400).json({error:'Please complete all required fields.'});const r=await pool.query(`insert into appraisal_requests(name,email,phone,property_address,property_type,purpose,preferred_inspection_date,message) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,status`,[safe(name,150),safe(email,200),safe(phone,80),safe(property_address,400),safe(property_type,120),safe(purpose,200),preferred_inspection_date||null,safe(message)]);res.status(201).json(r.rows[0]);notify('New Bloomtide appraisal request',`New appraisal request received.\n\nName: ${name}\nEmail: ${email}\nPhone: ${phone}\nProperty: ${property_address}\nType: ${property_type}\nPurpose: ${purpose}\nPreferred inspection date: ${preferred_inspection_date||'Not specified'}\nMessage: ${message||'None'}\n\nSign in to the admin dashboard to review and set the fee.`);}));
 app.get('/api/jobs',asyncRoute(async(req,res)=>{const r=await pool.query(`select id,title,location,department,employment_type,salary_range,description,requirements,closing_date,created_at from jobs where published=true and (closing_date is null or closing_date>=current_date) order by created_at desc`);res.json(r.rows);}));
-app.post('/api/applications',asyncRoute(async(req,res)=>{const {job_id,name,email,phone,linkedin_url,resume_url,cover_letter}=req.body;if(!job_id||!name||!email)return res.status(400).json({error:'Job, name and email are required.'});const r=await pool.query(`insert into job_applications(job_id,name,email,phone,linkedin_url,resume_url,cover_letter) values($1,$2,$3,$4,$5,$6,$7) returning id,status`,[job_id,safe(name,150),safe(email,200),safe(phone,80),safe(linkedin_url,500),safe(resume_url,1000),safe(cover_letter,10000)]);res.status(201).json(r.rows[0]);}));
+app.post('/api/applications',asyncRoute(async(req,res)=>{const {job_id,name,email,phone,linkedin_url,resume_url,cover_letter}=req.body;if(!job_id||!name||!email)return res.status(400).json({error:'Job, name and email are required.'});const jobRow=await pool.query('select title from jobs where id=$1',[job_id]);const r=await pool.query(`insert into job_applications(job_id,name,email,phone,linkedin_url,resume_url,cover_letter) values($1,$2,$3,$4,$5,$6,$7) returning id,status`,[job_id,safe(name,150),safe(email,200),safe(phone,80),safe(linkedin_url,500),safe(resume_url,1000),safe(cover_letter,10000)]);res.status(201).json(r.rows[0]);notify(`New Bloomtide job application: ${jobRow.rows[0]?.title||'Job'}`,`New job application received.\n\nPosition: ${jobRow.rows[0]?.title||'Unknown'}\nName: ${name}\nEmail: ${email}\nPhone: ${phone||'Not provided'}\nLinkedIn: ${linkedin_url||'Not provided'}\nResume: ${resume_url||'Not provided'}\nCover letter: ${cover_letter||'None'}\n\nSign in to the admin dashboard to review this application.`);}));
 app.post('/api/admin/login',asyncRoute(async(req,res)=>{const email=safe(req.body.email||'',200).toLowerCase();const password=String(req.body.password||'');const r=await pool.query('select * from admins where lower(email)=lower($1)',[email]);if(!r.rowCount||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:'Invalid admin email or password.'});req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Could not start admin session.'});req.session.adminId=r.rows[0].id;req.session.adminEmail=r.rows[0].email;req.session.save(saveErr=>saveErr?res.status(500).json({error:'Could not save admin session.'}):res.json({ok:true,email:r.rows[0].email}));});}));
 app.post('/api/admin/logout',(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get('/api/admin/session',(req,res)=>{res.set('Cache-Control','no-store');res.json({authenticated:!!req.session?.adminId,email:req.session?.adminEmail||null});});
 app.get('/api/admin/appraisals',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query('select * from appraisal_requests order by created_at desc');res.json(r.rows);}));
-app.patch('/api/admin/appraisals/:id',requireAdmin,asyncRoute(async(req,res)=>{const status=safe(req.body.status||'',80);const rawFee=req.body.fee;const fee=rawFee===''||rawFee==null?null:Number(rawFee);if(!allowedStatuses.has(status))return res.status(400).json({error:'Invalid appraisal status.'});if(fee!==null&&(!Number.isFinite(fee)||fee<0))return res.status(400).json({error:'Enter a valid fee.'});const r=await pool.query('update appraisal_requests set status=$1,fee=$2 where id=$3 returning id,status,fee',[status,fee,req.params.id]);if(!r.rowCount)return res.status(404).json({error:'Appraisal request not found.'});res.json(r.rows[0]);}));
+app.patch('/api/admin/appraisals/:id',requireAdmin,asyncRoute(async(req,res)=>{const status=safe(req.body.status||'',80);const rawFee=req.body.fee;const fee=rawFee===''||rawFee==null?null:Number(rawFee);if(!allowedStatuses.has(status))return res.status(400).json({error:'Invalid appraisal status.'});if(fee!==null&&(!Number.isFinite(fee)||fee<0))return res.status(400).json({error:'Enter a valid fee.'});const before=await pool.query('select fee,email,name,property_address from appraisal_requests where id=$1',[req.params.id]);const r=await pool.query('update appraisal_requests set status=$1,fee=$2 where id=$3 returning id,status,fee',[status,fee,req.params.id]);if(!r.rowCount)return res.status(404).json({error:'Appraisal request not found.'});res.json(r.rows[0]);const prevFee=before.rows[0]?before.rows[0].fee:null;if(before.rowCount&&fee!==null&&Number(prevFee)!==fee&&before.rows[0].email){const client=before.rows[0];if(mailer){mailer.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:client.email,subject:'Your Bloomtide appraisal fee',text:`Hi ${client.name},\n\nBloomtide has reviewed your appraisal request for ${client.property_address}.\n\nApplicable fee: $${fee.toFixed(2)}\nStatus: ${status.replaceAll('_',' ')}\n\nWe will be in touch regarding next steps.\n\n— Bloomtide`}).catch(err=>console.error('Client fee email failed:',err.message));}}}));
 app.get('/api/admin/jobs',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query('select * from jobs order by created_at desc');res.json(r.rows);}));
 app.post('/api/admin/jobs',requireAdmin,asyncRoute(async(req,res)=>{const d=req.body;const r=await pool.query(`insert into jobs(title,location,department,employment_type,salary_range,description,requirements,closing_date,published) values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,[safe(d.title,200),safe(d.location,200),safe(d.department,150),safe(d.employment_type,100),safe(d.salary_range,150),safe(d.description,10000),safe(d.requirements,10000),d.closing_date||null,!!d.published]);res.status(201).json(r.rows[0]);}));
 app.patch('/api/admin/jobs/:id',requireAdmin,asyncRoute(async(req,res)=>{if(typeof req.body.published==='boolean')await pool.query('update jobs set published=$1 where id=$2',[req.body.published,req.params.id]);res.json({ok:true});}));
