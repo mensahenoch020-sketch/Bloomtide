@@ -18,11 +18,24 @@ if(process.env.SMTP_HOST&&process.env.SMTP_USER&&process.env.SMTP_PASS){
   console.warn('Email notifications are disabled: set SMTP_HOST, SMTP_USER and SMTP_PASS in Railway Variables to enable them.');
 }
 const NOTIFY_EMAIL=process.env.NOTIFY_EMAIL||process.env.ADMIN_EMAIL;
+const RESEND_API_KEY=process.env.RESEND_API_KEY;
 const RESUME_TYPES=new Set(['application/pdf','application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document']);
 const resumeUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:5*1024*1024},fileFilter:(req,file,cb)=>RESUME_TYPES.has(file.mimetype)?cb(null,true):cb(new Error('Resume must be a PDF or Word document (.pdf, .doc, .docx).'))});
 function uploadResume(req,res,next){resumeUpload.single('resume')(req,res,err=>{if(err)return res.status(400).json({error:err.code==='LIMIT_FILE_SIZE'?'Resume must be smaller than 5MB.':err.message});next();});}
 async function notify(subject,text,attachments){
-  if(!mailer||!NOTIFY_EMAIL)return;
+  if(!NOTIFY_EMAIL)return;
+  if(RESEND_API_KEY){
+    try{
+      const payload={from:process.env.RESEND_FROM||'Bloomtide <onboarding@resend.dev>',to:NOTIFY_EMAIL,subject,text};
+      if(attachments&&attachments.length)payload.attachments=attachments.map(a=>({filename:a.filename,content:Buffer.isBuffer(a.content)?a.content.toString('base64'):a.content}));
+      const r=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Authorization':`Bearer ${RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(!r.ok)console.error('Resend notification failed:',r.status,await r.text());
+    }catch(err){
+      console.error('Resend notification failed:',err.message);
+    }
+    return;
+  }
+  if(!mailer)return;
   try{
     await mailer.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:NOTIFY_EMAIL,subject,text,attachments});
   }catch(err){
@@ -87,6 +100,7 @@ app.post('/api/admin/jobs',requireAdmin,asyncRoute(async(req,res)=>{const d=req.
 app.patch('/api/admin/jobs/:id',requireAdmin,asyncRoute(async(req,res)=>{if(typeof req.body.published==='boolean')await pool.query('update jobs set published=$1 where id=$2',[req.body.published,req.params.id]);res.json({ok:true});}));
 app.get('/api/admin/applications',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query(`select a.id,a.job_id,a.name,a.email,a.phone,a.linkedin_url,a.cover_letter,a.status,a.created_at,a.resume_filename,(a.resume_data is not null) as has_resume,j.title as job_title from job_applications a left join jobs j on j.id=a.job_id order by a.created_at desc`);res.json(r.rows);}));
 app.get('/api/admin/applications/:id/resume',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query('select resume_filename,resume_mimetype,resume_data from job_applications where id=$1',[req.params.id]);if(!r.rowCount||!r.rows[0].resume_data)return res.status(404).json({error:'No resume on file for this application.'});const row=r.rows[0];res.set('Content-Type',row.resume_mimetype||'application/octet-stream');res.set('Content-Disposition',`attachment; filename="${(row.resume_filename||'resume').replace(/"/g,'')}"`);res.send(row.resume_data);}));
+app.delete('/api/admin/applications/:id',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query('delete from job_applications where id=$1 returning id',[req.params.id]);if(!r.rowCount)return res.status(404).json({error:'Application not found.'});res.json({ok:true});}));
 app.get('/api/admin/licenses',requireAdmin,asyncRoute(async(req,res)=>{const r=await pool.query('select * from licenses order by state');res.json(r.rows);}));
 app.post('/api/admin/licenses',requireAdmin,asyncRoute(async(req,res)=>{const d=req.body;const r=await pool.query(`insert into licenses(state,license_type,license_number,expires_on,active) values($1,$2,$3,$4,$5) returning *`,[safe(d.state,80),safe(d.license_type,200),safe(d.license_number,200),d.expires_on||null,d.active!==false]);res.status(201).json(r.rows[0]);}));
 
